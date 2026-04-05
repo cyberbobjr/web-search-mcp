@@ -1,6 +1,5 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
@@ -27,35 +26,43 @@ export class EnhancedContentExtractor {
     this.browserPool = new BrowserPool();
     this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
     
-    console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
+    console.error(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
   }
 
   async extractContent(options: ContentExtractionOptions): Promise<string> {
     const { url } = options;
-    
-    console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
-    
+    const debug = process.env.DEBUG_EXTRACTION === 'true';
+
+    if (debug) console.error(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
+
     // First, try with regular HTTP client (faster)
     try {
       const content = await this.extractWithAxios(options);
-      console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
+      if (debug) console.error(`[EnhancedContentExtractor] Axios OK: ${content.length} chars from ${url}`);
       return content;
-    } catch (error) {
-      console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      
+    } catch (axiosError) {
+      const axiosMsg = this.getSpecificErrorMessage(axiosError);
+      console.error(`[EnhancedContentExtractor] Axios failed for ${url}: ${axiosMsg}`);
+
+      // Skip browser fallback when axiosOnly is requested (e.g. for lightweight previews)
+      if (options.axiosOnly) {
+        throw axiosError;
+      }
+
       // Check if this looks like a case where browser would help
-      if (this.shouldUseBrowser(error, url)) {
-        console.log(`[EnhancedContentExtractor] Falling back to headless browser for: ${url}`);
+      if (this.shouldUseBrowser(axiosError, url)) {
+        if (debug) console.error(`[EnhancedContentExtractor] Falling back to browser for: ${url}`);
         try {
           const content = await this.extractWithBrowser(options);
-          console.log(`[EnhancedContentExtractor] Successfully extracted with browser: ${content.length} chars`);
+          if (debug) console.error(`[EnhancedContentExtractor] Browser OK: ${content.length} chars from ${url}`);
           return content;
         } catch (browserError) {
-          console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
-          throw new Error(`Both axios and browser extraction failed for ${url}`);
+          const browserMsg = this.getSpecificErrorMessage(browserError);
+          console.error(`[EnhancedContentExtractor] Browser also failed for ${url}: ${browserMsg}`);
+          throw new Error(`axios: ${axiosMsg} | browser: ${browserMsg}`);
         }
       } else {
-        throw error;
+        throw axiosError;
       }
     }
   }
@@ -74,7 +81,7 @@ export class EnhancedContentExtractor {
     
     // Truncate content if it exceeds the limit (instead of axios throwing an error)
     if (maxContentLength && content.length > maxContentLength) {
-      console.log(`[EnhancedContentExtractor] Content truncated from ${content.length} to ${maxContentLength} characters for ${url}`);
+      console.error(`[EnhancedContentExtractor] Content truncated from ${content.length} to ${maxContentLength} characters for ${url}`);
       content = content.substring(0, maxContentLength);
     }
     
@@ -137,6 +144,7 @@ export class EnhancedContentExtractor {
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
           parameters.name === 'notifications' ?
+            // eslint-disable-next-line no-undef
             Promise.resolve({ state: 'default' } as unknown as PermissionStatus) :
             originalQuery(parameters)
         );
@@ -164,19 +172,19 @@ export class EnhancedContentExtractor {
       });
 
       // Navigate with realistic options and better error handling
-      console.log(`[BrowserExtractor] Navigating to ${url}`);
-      
+      console.error(`[BrowserExtractor] Navigating to ${url}`);
+
       try {
-        await page.goto(url, { 
-          waitUntil: 'domcontentloaded', // Don't wait for all resources
-          timeout: Math.min(timeout, 8000) // Reduced timeout, max 8 seconds
+        await page.goto(url, {
+          waitUntil: 'load', // Wait for full load so JS-rendered content is available
+          timeout: Math.min(timeout, 10000)
         });
       } catch (gotoError) {
         // Handle specific protocol errors
         const errorMessage = gotoError instanceof Error ? gotoError.message : String(gotoError);
         
         if (errorMessage.includes('ERR_HTTP2_PROTOCOL_ERROR') || errorMessage.includes('HTTP2')) {
-          console.log(`[BrowserExtractor] HTTP/2 error detected, trying with HTTP/1.1`);
+          console.error(`[BrowserExtractor] HTTP/2 error detected, trying with HTTP/1.1`);
           
           // Create a new context with HTTP/1.1 preference
           await context.close();
@@ -218,25 +226,33 @@ export class EnhancedContentExtractor {
         }
       }
 
-      // Quick human simulation - reduced time
       await page.mouse.move(Math.random() * 100, Math.random() * 100);
-      
-      // Reduced wait time for dynamic content
-      await page.waitForTimeout(500 + Math.random() * 1000);
 
-      // Quick check for main content without long wait
+      // Wait for network idle so JS-rendered content (SPAs, docs) is fully in the DOM
       try {
-        await page.waitForSelector('article, main, .content, .post-content, .entry-content', {
-          timeout: 2000
-        });
+        await page.waitForLoadState('networkidle', { timeout: 5000 });
       } catch {
-        console.log(`[BrowserExtractor] No main content selector found, proceeding anyway`);
+        console.error(`[BrowserExtractor] networkidle timeout, proceeding anyway`);
+      }
+
+      // Wait for any known content selector to appear
+      try {
+        await page.waitForSelector(
+          'article, main, [role="main"], .content, .post-content, .entry-content, ' +
+          '.md-content, .rst-content, .doc-content, [data-md-component="content"], ' +
+          '.docs-content, .documentation, .markdown-body, .prose',
+          { timeout: 3000 }
+        );
+      } catch {
+        console.error(`[BrowserExtractor] No content selector matched, proceeding with full body`);
       }
 
       // Extract content using the same logic as axios version
       const html = await page.content();
+      const rawBodyLength = html.length;
       const content = this.parseContent(html);
 
+      console.error(`[BrowserExtractor] raw HTML: ${rawBodyLength} chars → parsed: ${content.length} chars from ${url}`);
       await context.close();
       return content;
 
@@ -246,55 +262,28 @@ export class EnhancedContentExtractor {
     }
   }
 
-  private async simulateHumanBehavior(page: Page): Promise<void> {
-    try {
-      // Random mouse movements
-      await page.mouse.move(
-        Math.random() * 800,
-        Math.random() * 600
-      );
-
-      // Random scroll (common human behavior)
-      const scrollY = Math.random() * 500;
-      await page.evaluate((y) => window.scrollTo(0, y), scrollY);
-
-      // Small random delay
-      await page.waitForTimeout(500 + Math.random() * 1000);
-
-      // Sometimes click somewhere innocuous
-      if (Math.random() > 0.7) {
-        try {
-          await page.click('body', { timeout: 1000 });
-        } catch {
-          // Ignore click failures
-        }
-      }
-    } catch {
-      // Ignore simulation errors
-      console.log(`[BrowserExtractor] Behavior simulation failed, continuing`);
-    }
-  }
-
-  private shouldUseBrowser(error: any, url: string): boolean {
+  private shouldUseBrowser(error: unknown, url: string): boolean {
     // Conditions where browser is likely to succeed where axios failed
+    const axiosError = axios.isAxiosError(error) ? error : null;
+    const errMessage = error instanceof Error ? error.message : '';
     const indicators = [
       // HTTP status codes that suggest bot detection
-      error.response?.status === 403,
-      error.response?.status === 429,
-      error.response?.status === 503,
-      
+      axiosError?.response?.status === 403,
+      axiosError?.response?.status === 429,
+      axiosError?.response?.status === 503,
+
       // Error messages suggesting JS requirement
-      error.message?.includes('timeout'),
-      error.message?.includes('Access denied'),
-      error.message?.includes('Forbidden'),
-      error.message?.includes('Low quality content detected'),
-      
+      errMessage.includes('timeout'),
+      errMessage.includes('Access denied'),
+      errMessage.includes('Forbidden'),
+      errMessage.includes('Low quality content detected'),
+
       // Response content suggesting bot detection
-      error.response?.data?.includes('Please enable JavaScript'),
-      error.response?.data?.includes('captcha'),
-      error.response?.data?.includes('unusual traffic'),
-      error.response?.data?.includes('robot'),
-      
+      typeof axiosError?.response?.data === 'string' && axiosError.response.data.includes('Please enable JavaScript'),
+      typeof axiosError?.response?.data === 'string' && axiosError.response.data.includes('captcha'),
+      typeof axiosError?.response?.data === 'string' && axiosError.response.data.includes('unusual traffic'),
+      typeof axiosError?.response?.data === 'string' && axiosError.response.data.includes('robot'),
+
       // Sites known to be JS-heavy
       url.includes('twitter.com'),
       url.includes('facebook.com'),
@@ -398,13 +387,13 @@ export class EnhancedContentExtractor {
   }
 
   async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
-    console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
+    console.error(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
     
     // Filter out PDF files first
     const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
     const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
     
-    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
+    console.error(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
     
     // Process results concurrently with timeout
     const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
@@ -422,7 +411,7 @@ export class EnhancedContentExtractor {
         const content = await Promise.race([extractionPromise, timeoutPromise]);
         const cleanedContent = cleanText(content, this.maxContentLength);
         
-        console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
+        console.error(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
         return {
           ...result,
           fullContent: cleanedContent,
@@ -432,7 +421,7 @@ export class EnhancedContentExtractor {
           fetchStatus: 'success' as const,
         };
       } catch (error) {
-        console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
+        console.error(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
         return {
           ...result,
           fullContent: '',
@@ -458,7 +447,7 @@ export class EnhancedContentExtractor {
       ...failedResults.slice(0, Math.max(0, targetCount - successfulResults.length))
     ].slice(0, targetCount);
     
-    console.log(`[EnhancedContentExtractor] Completed processing ${resultsToProcess.length} results, extracted ${successfulResults.length} successful/${failedResults.length} failed`);
+    console.error(`[EnhancedContentExtractor] Completed processing ${resultsToProcess.length} results, extracted ${successfulResults.length} successful/${failedResults.length} failed`);
     return enhancedResults;
   }
 
@@ -471,11 +460,15 @@ export class EnhancedContentExtractor {
     // Remove navigation, header, footer, and other non-content elements
     $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
     
-    // Remove elements with common ad/tracking classes
-    $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
-    
-    // Remove elements with common non-content IDs
-    $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="tooltip"], [id*="toolbar"], [id*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+    // Remove elements with specific ad/tracking classes (avoid broad substrings like [class*="ad"]
+    // which also matches "shadow", "gradient", "admonition", etc.)
+    $('[class="ad"], [class="ads"], .advertisement, .ad-container, .ad-wrapper, .ad-unit, ' +
+      '.tracking, .analytics, .pixel, .beacon, .sponsored, .affiliate, ' +
+      '.promo-banner, .popup-modal, .cookie-modal').remove();
+
+    // Remove elements with specific non-content IDs (avoid broad [id*="ad"] for same reason)
+    $('#sidebar, #navigation, #menu, #footer, #header, ' +
+      '#advertisement, #tracking, #analytics, #popup, #modal, #overlay, #banner').remove();
     
     // Remove image-related elements and attributes
     $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
@@ -498,6 +491,18 @@ export class EnhancedContentExtractor {
       'article',
       'main',
       '[role="main"]',
+      // Documentation sites (MkDocs, Sphinx, Docusaurus, GitBook, etc.)
+      '.md-content',
+      '.rst-content',
+      '[data-md-component="content"]',
+      '.docs-content',
+      '.documentation',
+      '.markdown-body',
+      '.prose',
+      '.doc-content',
+      '.docMainContainer',
+      '.theme-doc-markdown',
+      // Generic content
       '.content',
       '.post-content',
       '.entry-content',
@@ -518,7 +523,7 @@ export class EnhancedContentExtractor {
       if ($content.length > 0) {
         mainContent = $content.text().trim();
         if (mainContent.length > 100) { // Ensure we have substantial content
-          console.log(`[EnhancedContentExtractor] Found content with selector: ${selector} (${mainContent.length} chars)`);
+          console.error(`[EnhancedContentExtractor] Found content with selector: ${selector} (${mainContent.length} chars)`);
           break;
         }
       }
@@ -526,14 +531,11 @@ export class EnhancedContentExtractor {
     
     // If no main content found, try body content
     if (!mainContent || mainContent.length < 100) {
-      console.log(`[EnhancedContentExtractor] No main content found, using body content`);
+      console.error(`[EnhancedContentExtractor] No main content found, using body content`);
       mainContent = $('body').text().trim();
     }
     
-    // Clean up the text
-    const cleanedContent = this.cleanTextContent(mainContent);
-    
-    return cleanText(cleanedContent, this.maxContentLength);
+    return this.cleanTextContent(mainContent);
   }
   
   private cleanTextContent(text: string): string {
@@ -563,25 +565,25 @@ export class EnhancedContentExtractor {
 
   private getSpecificErrorMessage(error: unknown): string {
     if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        return 'Request timeout';
-      }
-      if (error.response?.status === 403) {
-        return '403 Forbidden - Access denied';
-      }
-      if (error.response?.status === 404) {
-        return '404 Not found';
-      }
-      if (error.message.includes('maxContentLength')) {
-        return 'Content too long';
-      }
-      if (error.response?.status) {
-        return `HTTP ${error.response.status}: ${error.message}`;
-      }
+      if (error.code === 'ECONNABORTED') return 'Request timeout';
+      if (error.response?.status === 403) return '403 Forbidden';
+      if (error.response?.status === 404) return '404 Not found';
+      if (error.response?.status === 429) return '429 Rate limited';
+      if (error.response?.status === 503) return '503 Service unavailable';
+      if (error.message.includes('maxContentLength')) return 'Content too long';
+      if (error.response?.status) return `HTTP ${error.response.status}`;
+      if (error.code) return `Network error (${error.code})`;
       return `Network error: ${error.message}`;
     }
-    
-    return error instanceof Error ? error.message : 'Unknown error';
+
+    if (error instanceof Error) {
+      const msg = error.message;
+      // Playwright / browser errors — trim to the first sentence for readability
+      const firstLine = msg.split('\n')[0].trim();
+      return firstLine.length > 120 ? firstLine.substring(0, 120) + '…' : firstLine;
+    }
+
+    return 'Unknown error';
   }
 
   async closeAll(): Promise<void> {

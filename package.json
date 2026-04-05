@@ -9,6 +9,7 @@
     "web-search-mcp": "./dist/index.js"
   },
   "scripts": {
+    "postinstall": "playwright install chromium firefox",
     "build": "tsc && echo '✅ TypeScript compilation complete: dist/index.js'",
     "dev": "tsx watch src/index.ts",
     "start": "node ./dist/index.js",
@@ -31,7 +32,6 @@
     "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
     "p-limit": "^6.2.0",
-    "p-retry": "^6.2.1",
     "playwright": "^1.48.0",
     "zod": "^3.22.0"
   },

@@ -36,6 +36,12 @@ For extracting content from a specific webpage:
 2. Follows the URL and extracts the main page content
 3. Removes navigation, ads, and other non-content elements
 
+### 4. `clear-cache` (Cache Management)
+Flushes all cached search results and extracted page content from disk:
+1. Deletes all files under `CACHE_DIR`
+2. Returns the number of entries removed
+3. Useful when you want fresh results instead of serving cached data
+
 ## Compatibility
 
 This MCP server has been developed and tested with **LM Studio** and **LibreChat**. It has not been tested with other MCP clients.
@@ -141,12 +147,24 @@ The server supports several environment variables for configuration:
 - **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit)
 - **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
 
+### Cache
+
+Search results and extracted page content are cached to disk to avoid redundant network calls.
+
+- **`CACHE_TTL_HOURS`**: Cache entry lifetime in hours (default: 72)
+- **`CACHE_DIR`**: Directory where cache files are stored (default: `~/.cache/web-search-mcp/`)
+- **`CACHE_DISABLED`**: Set to `1` or `true` to disable the cache entirely (default: unset)
+- **`CACHE_DEBUG`**: Set to `true` to log cache hits and misses to stderr (default: false)
+
+Cache files are JSON stored under `<CACHE_DIR>/search/` and `<CACHE_DIR>/content/`. Use the `clear-cache` MCP tool to flush all entries on demand.
+
 ### Search Quality and Engine Selection
 
 - **`ENABLE_RELEVANCE_CHECKING`**: Enable/disable search result quality validation (default: true)
 - **`RELEVANCE_THRESHOLD`**: Minimum quality score for search results (0.0-1.0, default: 0.3)
 - **`FORCE_MULTI_ENGINE_SEARCH`**: Try all search engines and return best results (default: false)
 - **`DEBUG_BROWSER_LIFECYCLE`**: Enable detailed browser lifecycle logging for debugging (default: false)
+- **`DEBUG_EXTRACTION`**: Enable verbose per-URL content extraction logging (default: false)
 
 ## Troubleshooting
 
@@ -188,6 +206,54 @@ npm run dev    # Development with hot reload
 npm run build  # Build TypeScript to JavaScript
 npm run lint   # Run ESLint
 npm run format # Run Prettier
+```
+
+## Local Testing with MCP Inspector
+
+The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the official interactive UI for testing MCP servers locally without needing a full LLM client.
+
+### Prerequisites
+
+Build the project first:
+```bash
+npm run build
+```
+
+### Run the Inspector
+
+```bash
+npx @modelcontextprotocol/inspector node dist/index.js
+```
+
+This opens a web UI at `http://localhost:5173` (or the port shown in the terminal). From there you can:
+- Browse the three available tools (`full-web-search`, `get-web-search-summaries`, `get-single-web-page-content`)
+- Fill in arguments and invoke them interactively
+- Inspect the raw JSON responses
+
+### Pass Environment Variables
+
+```bash
+MAX_CONTENT_LENGTH=20000 BROWSER_HEADLESS=true \
+  npx @modelcontextprotocol/inspector node dist/index.js
+```
+
+### Quick Tool Examples
+
+**Search for something:**
+```json
+{ "query": "MCP protocol specification", "limit": 3 }
+```
+
+**Extract a single page:**
+```json
+{ "url": "https://modelcontextprotocol.io", "maxContentLength": 5000 }
+```
+
+### Using `tsx` (skips the build step)
+
+If you want to test source changes without rebuilding:
+```bash
+npx @modelcontextprotocol/inspector npx tsx src/index.ts
 ```
 
 ## MCP Tools
@@ -247,6 +313,17 @@ A utility tool for extracting content from a specific webpage:
     "url": "https://example.com/article",
     "maxContentLength": 5000
   }
+}
+```
+
+### 4. `clear-cache` (Cache Management)
+Flushes all cached data from disk. Takes no arguments.
+
+**Example Usage:**
+```json
+{
+  "name": "clear-cache",
+  "arguments": {}
 }
 ```
 
